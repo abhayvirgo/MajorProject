@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: finbert
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finbert-code-config
+  namespace: finbert
+data:
+  app.py: |
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    
+    import torch
+    from transformers import pipeline
+    from flask import Flask, request, jsonify
+
+    print(f"PyTorch engine initialized. Version: {torch.__version__}")
+    print("Loading FinBERT Pipeline (Streaming ~440MB from Hugging Face)...")
+    pipe = pipeline("text-classification", model="ProsusAI/finbert", device=-1)
+    print("FinBERT Pipeline loaded successfully!")
+
+    app = Flask(__name__)
+
+    # NEW: Default root route to prevent 404 "Not Found" errors on basic browser tests
+    @app.route("/", methods=["GET"])
+    def health():
+        return jsonify({"status": "healthy", "model": "FinBERT engine is ready"}), 200
+
+    @app.route("/v1/inference", methods=["POST"])
+    def infer():
+        data = request.json or {}
+        inputs = data.get("request", [])
+        if not inputs:
+            return jsonify({"error": "Missing request text array"}), 400
+        results = pipe(inputs)
+        return jsonify(results)
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=5001)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finbert-cpu-deployment
+  namespace: finbert
+  labels:
+    app: finbert-cpu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: finbert-cpu
+  template:
+    metadata:
+      labels:
+        app: finbert-cpu
+    spec:
+      tolerations:
+      - operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        apps: phi-4
+      volumes:
+      - name: code-volume
+        configMap:
+          name: finbert-code-config
+      containers:
+      - name: finbert-api
+        image: "docker.io/library/python:3.11-slim"
+        command:
+        - "sh"
+        - "-c"
+        - |
+          echo "Setting up workspace..."
+          mkdir -p /app/tmp
+          cp /config/app.py /app/app.py
+          
+          export TMPDIR=/app/tmp
+          export PIP_TMPDIR=/app/tmp
+          export PIP_CACHE_DIR=/app/tmp
+
+          echo "Installing base deep learning utilities from main index..."
+          python -m pip install --no-cache-dir torch transformers flask
+          
+          echo "Verifying installation components..."
+          python -c "import torch; print('Sanity Check Passed! Torch version:', torch.__version__)" || exit 1
+          
+          echo "Purging workspace extraction cache..."
+          rm -rf /app/tmp
+          
+          echo "Launching FinBERT Server..."
+          python /app/app.py
+        volumeMounts:
+        - name: code-volume
+          mountPath: /config
+        ports:
+        - containerPort: 5001
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2.5Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: finbert-public-svc
+  namespace: finbert
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 5001
+    protocol: TCP
+  selector:
+    app: finbert-cpu
